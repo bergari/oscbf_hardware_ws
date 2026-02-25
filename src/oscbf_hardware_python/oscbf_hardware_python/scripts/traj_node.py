@@ -30,7 +30,7 @@ class EETrajNode(Node):
         # Based on the traj from the dynamic motion demo
         # TODO: make these values inputs
         self.traj = SinusoidalTaskTrajectory(
-            init_pos=(0.55, 0, 0.45),
+            init_pos=(0.45, 0, 0.45),
             init_rot=np.array(
                 [
                     [1, 0, 0],
@@ -38,8 +38,8 @@ class EETrajNode(Node):
                     [0, 0, -1],
                 ]
             ),
-            amplitude=(0.25, 0, 0),
-            angular_freq=(2, 0, 0),
+            amplitude=(0.2, 0, 0),
+            angular_freq=(1, 0, 0),
             phase=(0, 0, 0),
         )
 

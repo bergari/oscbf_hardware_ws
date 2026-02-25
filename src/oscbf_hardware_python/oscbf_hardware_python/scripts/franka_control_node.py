@@ -116,6 +116,48 @@ class DemoConfig(OSCBFTorqueConfig):
     def alpha_2(self, h_2):
         return 10.0 * h_2
 
+class CollisionsConfig(OSCBFTorqueConfig):
+
+    def __init__(
+        self,
+        robot: Manipulator,
+        z_min: float,
+        collision_positions: ArrayLike,
+        collision_radii: ArrayLike,
+    ):
+        self.z_min = z_min
+        self.collision_positions = np.atleast_2d(collision_positions)
+        self.collision_radii = np.ravel(collision_radii)
+        super().__init__(robot)
+
+    def h_2(self, z, **kwargs):
+        # Extract values
+        q = z[: self.num_joints]
+
+        # Collision Avoidance
+        robot_collision_pos_rad = self.robot.link_collision_data(q)
+        robot_collision_positions = robot_collision_pos_rad[:, :3]
+        robot_collision_radii = robot_collision_pos_rad[:, 3, None]
+        center_deltas = (
+            robot_collision_positions[:, None, :] - self.collision_positions[None, :, :]
+        ).reshape(-1, 3)
+        radii_sums = (
+            robot_collision_radii[:, None] + self.collision_radii[None, :]
+        ).reshape(-1)
+        h_collision = jnp.linalg.norm(center_deltas, axis=1) - radii_sums
+
+        # Whole body table avoidance
+        h_table = (
+            robot_collision_positions[:, 2] - self.z_min - robot_collision_radii.ravel()
+        )
+
+        return jnp.concatenate([h_collision, h_table])
+
+    def alpha(self, h):
+        return 10.0 * h
+
+    def alpha_2(self, h_2):
+        return 10.0 * h_2
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def compute_control(
@@ -216,8 +258,17 @@ class OSCBFNode(Node):
         self.get_logger().info("Loading Franka model...")
         self.robot = load_panda()
 
-        self.get_logger().info("Creating CBF...")
-        self.cbf_config = DemoConfig(self.robot, whole_body_pos_min, whole_body_pos_max)
+        # Uncomment to activate DemoConfig
+        # self.get_logger().info("Creating CBF...")
+        # self.cbf_config = DemoConfig(self.robot, whole_body_pos_min, whole_body_pos_max)
+
+        # Uncomment to activate CollisionConfig with simulated obstacles
+        self.get_logger().info("Creating CBF with Simulation Obstacles...")
+        collision_pos = np.array([[0.45, 0.0, 0.45]])
+        collision_radii = np.array([0.05])
+        z_min = 0.1 # Table height
+        self.cbf_config = CollisionsConfig(self.robot, z_min, collision_pos, collision_radii)
+        
         self.cbf = CBF.from_config(self.cbf_config)
 
         kp_pos = 50.0
