@@ -14,6 +14,7 @@ from oscbf_msgs.msg import EEState
 from geometry_msgs.msg import Point, Quaternion, Vector3
 
 from oscbf_hardware_python.utils.trajectory import SinusoidalTaskTrajectory
+from oscbf_hardware_python.utils.trajectory import LinearTaskTrajectory
 
 
 class EETrajNode(Node):
@@ -42,6 +43,12 @@ class EETrajNode(Node):
             angular_freq=(1, 0, 0),
             phase=(0, 0, 0),
         )
+
+        # self.traj = LinearTaskTrajectory(
+        #     start_pos=(0.45, 0, 0.45),
+        #     end_pos=(0.6, 0, 0.45),
+        #     duration=5.0
+        # )
 
         self.freq = 100
         self.timer = self.create_timer(1 / self.freq, self.publish_ee_state)

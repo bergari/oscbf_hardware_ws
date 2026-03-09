@@ -131,3 +131,42 @@ class SinusoidalTaskTrajectory(TaskTrajectory):
 
     def alpha(self, t: float) -> np.ndarray:
         return np.zeros(3)
+
+class LinearTaskTrajectory(TaskTrajectory):
+    """Defines a linear trajectory from a start to an end pose."""
+
+    def __init__(self, start_pos, end_pos, duration, init_rot=None):
+        self.start_pos = np.asarray(start_pos)
+        self.end_pos = np.asarray(end_pos)
+        self.duration = duration
+        if init_rot is None:
+            self.init_rot = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        else:
+            self.init_rot = np.asarray(init_rot)
+
+    def position(self, t: float) -> np.ndarray:
+        """Linearly interpolates position."""
+        s = min(t / self.duration, 1.0)
+        return self.start_pos + s * (self.end_pos - self.start_pos)
+
+    def rotation(self, t: float) -> np.ndarray:
+        """Keeps rotation constant."""
+        return self.init_rot
+
+    def velocity(self, t: float) -> np.ndarray:
+        """Returns constant velocity during motion."""
+        if t < self.duration:
+            return (self.end_pos - self.start_pos) / self.duration
+        return np.zeros(3)
+
+    def omega(self, t: float) -> np.ndarray:
+        """No angular velocity."""
+        return np.zeros(3)
+
+    def acceleration(self, t: float) -> np.ndarray:
+        """No linear acceleration."""
+        return np.zeros(3)
+
+    def alpha(self, t: float) -> np.ndarray:
+        """No angular acceleration."""
+        return np.zeros(3)

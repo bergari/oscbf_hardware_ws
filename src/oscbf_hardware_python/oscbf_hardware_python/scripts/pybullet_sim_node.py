@@ -1,4 +1,6 @@
-"""Test the OSCBF ROS2 communication with pybullet
+#!/usr/bin/env python3
+"""
+Test the OSCBF ROS2 communication with pybullet
 
 This will mimic the franka c++ communication node which listens to joint torques
 and publishes joint states
@@ -77,6 +79,7 @@ class PybulletNode(Node):
 
         # Apply the joint torques to the robot in the simulation
         self.env.apply_control(joint_torques)
+        #print("applied torques")
 
         # Step sim
         self.env.step()
