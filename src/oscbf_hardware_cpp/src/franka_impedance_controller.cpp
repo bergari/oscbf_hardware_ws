@@ -19,6 +19,8 @@ using namespace std::chrono_literals;
  *
  * @param[in] robot Robot instance to set behavior on.
  */
+
+//Default behavior with lower collision thresholds and higher impedance for more rigid behavior.
 void setDefaultBehavior(franka::Robot& robot) {
     robot.setCollisionBehavior(
         {{20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0}}, {{20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0}},
@@ -26,10 +28,25 @@ void setDefaultBehavior(franka::Robot& robot) {
         {{20.0, 20.0, 20.0, 20.0, 20.0, 20.0}}, {{20.0, 20.0, 20.0, 20.0, 20.0, 20.0}},
         {{10.0, 10.0, 10.0, 10.0, 10.0, 10.0}}, {{10.0, 10.0, 10.0, 10.0, 10.0, 10.0}});
     robot.setJointImpedance({{3000, 3000, 3000, 2500, 2500, 2000, 2000}});
+    // Cartesian Impedance: {{x, y, z, roll, pitch, yaw}}
     robot.setCartesianImpedance({{3000, 3000, 3000, 300, 300, 300}});
   }
-  
 
+// Default behavior with higher collision thresholds and lower impedance for more compliant behavior.
+// void setDefaultBehavior(franka::Robot& robot) {
+//     robot.setCollisionBehavior(
+//         {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0}}, {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0}},
+//         {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0}}, {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0}},
+//         {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0}}, {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0}},
+//         {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0}}, {{40.0, 40.0, 40.0, 40.0, 40.0, 40.0}});
+
+//     robot.setJointImpedance({{300.0, 300.0, 300.0, 250.0, 250.0, 200.0, 200.0}});
+//     // robot.setJointImpedance({{0, 0, 0, 0, 0, 0, 0}});
+//     // {{x, y, z, roll, pitch, yaw}}
+//     robot.setCartesianImpedance({{300.0, 300.0, 300.0, 30.0, 30.0, 30.0}});
+//     // robot.setCartesianImpedance({{0, 0, 0, 0, 0, 0}});
+// }
+  
 /**
  * @class FrankaImpedanceController
  * @brief A ROS2 node for controlling a Franka Panda robot using impedance control

@@ -39,7 +39,8 @@ class EETrajNode(Node):
                     [0, 0, -1],
                 ]
             ),
-            amplitude=(0.2, 0, 0),
+            amplitude=(0, 0, 0),
+            #amplitude=(0.2, 0, 0),
             angular_freq=(1, 0, 0),
             phase=(0, 0, 0),
         )
