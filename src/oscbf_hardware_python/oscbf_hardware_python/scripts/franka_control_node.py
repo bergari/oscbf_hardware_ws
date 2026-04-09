@@ -133,36 +133,28 @@ class CollisionsConfig(OSCBFTorqueConfig):
         self.whole_body_pos_max = np.asarray(whole_body_pos_max)
         super().__init__(robot)
 
-    # def h_1(self, z, *args, **kwargs):
-    #     """Relative Degree 1: Joint Velocity Limits"""
-    #     qdot = z[self.num_joints :]      
-    #     # Joint velocity limits
-    #     joint_max_vels = jnp.asarray(self.robot.joint_max_velocities)
-    #     qdot_max = joint_max_vels
-    #     qdot_min = -joint_max_vels
-    #     return jnp.concatenate([qdot_max - qdot, qdot - qdot_min])
-
     def h_1(self, z, *args, **kwargs):
-        """Relative Degree 1: Velocity Limits & Dynamic Collision Avoidance"""
+        """Relative Degree 1: Velocity Limits & Dynamic Capsule Collision Avoidance"""
         q = z[: self.num_joints]
         qdot = z[self.num_joints :]      
 
-        # Joint velocity limits
         joint_max_vels = jnp.asarray(self.robot.joint_max_velocities)
         h_qdot = jnp.concatenate([joint_max_vels - qdot, qdot - (-joint_max_vels)])
 
-        # Extract dynamic obstacles
-        if len(args) >= 3:
-            obs_pos = args[0]
-            obs_radii = args[1]
-            obs_vel = args[2] # Obstacle velocity
+        # Extract dynamic obstacle capsules (Starts and Ends)
+        if len(args) >= 5:
+            obs_start = args[0]      # Shape: (N_obs, 3)
+            obs_end = args[1]        # Shape: (N_obs, 3)
+            obs_radii = args[2]      # Shape: (N_obs,)
+            obs_vel_start = args[3]  # Shape: (N_obs, 3)
+            obs_vel_end = args[4]    # Shape: (N_obs, 3)
         else:
-            obs_pos = jnp.full((6, 3), 100.0)
+            obs_start = jnp.full((6, 3), 100.0)
+            obs_end = jnp.full((6, 3), 100.0)
             obs_radii = jnp.zeros(6)
-            obs_vel = jnp.zeros((6, 3))
+            obs_vel_start = jnp.zeros((6, 3))
+            obs_vel_end = jnp.zeros((6, 3))
 
-        # Calculate Robot Sphere Positions and Velocities
-        # JVP calculates v_robot = J(q) * qdot instantly for all spheres
         rob_pos_rad, rob_vel_rad = jax.jvp(
             self.robot.link_collision_data, (q,), (qdot,)
         )
@@ -170,27 +162,42 @@ class CollisionsConfig(OSCBFTorqueConfig):
         rob_radii = rob_pos_rad[:, 3]
         rob_vel = rob_vel_rad[:, :3]
 
-        # Calculate Distance and Normal Vectors
-        # Broadcasting to compare every robot sphere against every obstacle
-        delta_p = rob_pos[:, None, :] - obs_pos[None, :, :]  # Shape: (N_rob, N_obs, 3)
-        dist = jnp.linalg.norm(delta_p, axis=2)              # Shape: (N_rob, N_obs)
-        normals = delta_p / (dist[..., None] + 1e-6)         # Shape: (N_rob, N_obs, 3)
+        # Find closest point on each capsule centerline to each robot sphere center
+        A = obs_start[None, :, :] # Start of segment (1, N_obs, 3)
+        B = obs_end[None, :, :]   # End of segment (1, N_obs, 3)
+        P = rob_pos[:, None, :]   # Robot spheres (N_rob, 1, 3)
 
-        # Calculate Relative Approach Speed (h0_dot)
-        delta_v = rob_vel[:, None, :] - obs_vel[None, :, :]  # Shape: (N_rob, N_obs, 3)
-        h0_dot = jnp.sum(normals * delta_v, axis=2)          # Dot product along 3rd axis
+        AB = B - A
+        AP = P - A
 
-        # Calculate Base Distance (h0)
+        AB_dot_AB = jnp.sum(AB * AB, axis=-1) + 1e-6 # Avoid div by zero
+        AP_dot_AB = jnp.sum(AP * AB, axis=-1)
+        t = AP_dot_AB / AB_dot_AB
+        
+        # Clip t to [0, 1] to keep the closest point strictly on the segment
+        t = jnp.clip(t, 0.0, 1.0) 
+
+        # Compute the closest point C on the capsule centerline to each robot sphere center
+        C = A + t[..., None] * AB 
+
+        # Interpolate the velocity of the obstacle at point C
+        vel_A = obs_vel_start[None, :, :]
+        vel_B = obs_vel_end[None, :, :]
+        vel_C = vel_A + t[..., None] * (vel_B - vel_A)
+
+        # Standard CBF calculations using C
+        delta_p = P - C  
+        dist = jnp.linalg.norm(delta_p, axis=2)
+        normals = delta_p / (dist[..., None] + 1e-6)
+
+        delta_v = rob_vel[:, None, :] - vel_C
+        h0_dot = jnp.sum(normals * delta_v, axis=2)
+
         radii_sum = rob_radii[:, None] + obs_radii[None, :]
-        safety_padding = 0.05 # Add a safety margin to the combined radii (just for debugging)
+        safety_padding = 0.05 # use for testing, but better way is to adapt capsule radii
         h0 = dist - radii_sum - safety_padding
 
-        # Formulate the Dynamic CBF
-        # Higher gamma softer response, lower gamma more aggressive
-        # CBF requires h0_dot + gamma * h0 >= 0 (note: h0_dot is negative when approach robot)
-        # With gamma = 1, if h0_dot is -0.5 m/s when h0 is 0.5m, we get -0.5 + 1*0.5 = 0, right at the boundary. 
-        # If gamma = 2, we get -0.5 + 2*0.5 = 0.5, giving us a safety margin. Meaning the robot would need to be approached faster or be closer for the CBF to activate.
-        gamma = 2
+        gamma = 2.0
         h_collision_dynamic = (h0_dot + gamma * h0).ravel()
 
         return jnp.concatenate([h_qdot, h_collision_dynamic])
@@ -274,9 +281,11 @@ def compute_control(
     cbf: CBF,
     z: ArrayLike,
     z_ee_des: ArrayLike,
-    obs_positions: ArrayLike,
+    obs_start: ArrayLike,
+    obs_end: ArrayLike,
     obs_radii: ArrayLike,
-    obs_velocities: ArrayLike,
+    obs_vel_start: ArrayLike,
+    obs_vel_end: ArrayLike,
 ):
     q = z[: robot.num_joints]
     qdot = z[robot.num_joints :]
@@ -300,15 +309,17 @@ def compute_control(
     tau = cbf.safety_filter(
         z, 
         u_nom, 
-        obs_positions, 
+        obs_start, 
+        obs_end,    
         obs_radii,
-        obs_velocities
+        obs_vel_start,
+        obs_vel_end,
     )
 
     return tau - g
 
 class OSCBFNode(Node):
-    MAX_TRACKED_OBS = 5 # Pad to this many obstacles to keep matrix sizes constant
+    MAX_TRACKED_OBS = 10 # Pad to this many obstacles to keep matrix sizes constant
 
     def __init__(
         self,
@@ -358,6 +369,11 @@ class OSCBFNode(Node):
         self.last_torque_cmd = None
         self.last_joint_state = None
         self.last_received_target_state = None
+
+        self.tracked_joints = {}  # Format: {'left_arm': {'start': pos, 'end': pos}}
+        self.tracked_vels = {}  # Format: {'left_arm': {'start': vel, 'end': vel}}
+        self.last_tracker_pos = {}
+
         self.tracker_centroids = np.zeros((0, 3)) # Initialize as empty array
         self.tracker_velocities = np.zeros((0, 3)) # Initialize as empty array
         
@@ -378,7 +394,7 @@ class OSCBFNode(Node):
         self.cbf = CBF.from_config(self.cbf_config)
         
         # Initialize the padded arrays for dynamic obstacles
-        self.current_obs_pos, self.current_obs_radii, self.current_obs_vel = self._get_padded_obstacles()
+        self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end = self._get_padded_obstacles()
 
         kp_pos = 50.0 # Initial value = 50
         kp_rot = 20.0 # Initial value = 20
@@ -402,81 +418,98 @@ class OSCBFNode(Node):
         self.get_logger().info("OSCBF Node initialization complete.")
 
     def _get_padded_obstacles(self):
-        """Creates fixed-size obstacle arrays for JAX."""
-        # Use for testing/demo purposes, currently set far away from robot 
-        virtual_obstacle_pos = np.array([[100, 0.0, 0.45]])
-        virtual_obstacle_radius = np.array([0.20])
-        virtual_obstacle_vel = np.array([[0.0, 0.0, 0.0]])
+        start_list, end_list, rad_list, v_start_list, v_end_list = [], [], [], [], []
         
-        pos_list = [virtual_obstacle_pos]
-        rad_list = [virtual_obstacle_radius]
-        vel_list = [virtual_obstacle_vel]
+        def add_capsule(j_start, j_end, radius):
+            """Helper to add a capsule if both joints are currently tracked"""
+            if j_start in self.tracked_joints and j_end in self.tracked_joints:
+                start_list.append(self.tracked_joints[j_start])
+                end_list.append(self.tracked_joints[j_end])
+                rad_list.append(radius)
+                v_start_list.append(self.tracked_vels[j_start])
+                v_end_list.append(self.tracked_vels[j_end])
+
+        def add_sphere(joint, radius):
+            """A sphere is just a capsule where start and end are the same point"""
+            add_capsule(joint, joint, radius)
+
+        # 1. Wrists (15cm Spheres)
+        add_sphere("fused_left wrist", 0.15)
+        add_sphere("fused_right wrist", 0.15)
         
-        num_tracked = min(self.tracker_centroids.shape[0], self.MAX_TRACKED_OBS)
+        # 2. Lower Arms (8cm Capsules)
+        add_capsule("fused_left elbow", "fused_left wrist", 0.08)
+        add_capsule("fused_right elbow", "fused_right wrist", 0.08)
         
-        # Add real tracked markers
-        if num_tracked > 0:
-            ones = np.ones((num_tracked, 1))
-            centroids_homogeneous = np.hstack([self.tracker_centroids[:num_tracked], ones])
-            centroids_base_frame = (self.T_C_to_B @ centroids_homogeneous.T).T[:, :3]
-            self.get_logger().info(f"Tracker centroids (base frame): {centroids_base_frame}")
-            pos_list.append(centroids_base_frame)
-            rad_list.append(np.full(num_tracked, 0.15)) # Change this if you want different radii for the tracked obstacles
-            vel_list.append(self.tracker_velocities[:num_tracked])
-            
-        # Pad the rest with dummy obstacles far away
+        # 3. Upper Arms (10cm Capsules)
+        add_capsule("fused_left shoulder", "fused_left elbow", 0.10)
+        add_capsule("fused_right shoulder", "fused_right elbow", 0.10)
+        
+        # 4. Head (10cm Sphere)
+        add_sphere("fused_nose", 0.10) 
+        
+        # 5. Torso Sides (15cm Capsules)
+        add_capsule("fused_left shoulder", "fused_left hip", 0.15)
+        add_capsule("fused_right shoulder", "fused_right hip", 0.15)
+
+        # How many obstacles did we successfully build?
+        num_tracked = len(start_list)
+        
+        # We must pad up to exactly MAX_TRACKED_OBS (10) for JAX to stay compiled
         num_padding = self.MAX_TRACKED_OBS - num_tracked
-        if num_padding > 0:
-            pos_list.append(np.full((num_padding, 3), 100.0)) # 100 meters away
-            rad_list.append(np.zeros(num_padding))            # 0 radius
-            vel_list.append(np.zeros((num_padding, 3)))     # 0 velocity
+        
+        # If we lost tracking of everything, provide at least one dummy target
+        if num_tracked == 0:
+            start_list.append(np.array([100.0, 0.0, 0.0]))
+            end_list.append(np.array([100.0, 0.0, 0.0]))
+            rad_list.append(0.0)
+            v_start_list.append(np.zeros(3))
+            v_end_list.append(np.zeros(3))
+            num_padding -= 1
             
-        return np.vstack(pos_list), np.concatenate(rad_list), np.vstack(vel_list)
+        if num_padding > 0:
+            start_list.extend([np.array([100.0, 0.0, 0.0])] * num_padding)
+            end_list.extend([np.array([100.0, 0.0, 0.0])] * num_padding)
+            rad_list.extend([0.0] * num_padding)
+            v_start_list.extend([np.zeros(3)] * num_padding)
+            v_end_list.extend([np.zeros(3)] * num_padding)
+            
+        return (
+            np.vstack(start_list), 
+            np.vstack(end_list), 
+            np.array(rad_list), 
+            np.vstack(v_start_list), 
+            np.vstack(v_end_list)
+        )
 
     def tracker_callback(self, msg: MarkerArray):
-        marker_positions = []
-        marker_velocities = []
         t_now = self.get_clock().now()
-        min_dt = 0.005 
-        
-        if not hasattr(self, 'last_tracker_pos'):
-            self.last_tracker_pos = None
-            self.last_tracker_time = t_now
-            self.filtered_vel = np.zeros(3) # Initialize the filter memory
-
-        dt = (t_now - self.last_tracker_time).nanoseconds / 1e9
+        dt = (t_now - getattr(self, 'last_tracker_time', t_now)).nanoseconds / 1e9
         self.last_tracker_time = t_now
-
+        
         for marker in msg.markers:
-            if marker.ns == "fused_left wrist":
-                pos = np.array([marker.pose.position.x, marker.pose.position.y, marker.pose.position.z])
-                marker_positions.append(pos)
+            name = marker.ns  # e.g., "fused_left wrist", "fused_head", etc.
+            pos = np.array([marker.pose.position.x, marker.pose.position.y, marker.pose.position.z])
+            
+            # Convert to base frame immediately for easier math later
+            pos_base = (self.T_C_to_B[:3, :3] @ pos) + self.T_C_to_B[:3, 3]
+            self.tracked_joints[name] = pos_base
+            
+            # Simple EMA Velocity
+            if name in self.last_tracker_pos and dt > 0.005:
+                raw_v = (pos_base - self.last_tracker_pos[name]) / dt
+                old_v = self.tracked_vels.get(name, np.zeros(3))
+                smooth_v = 0.4 * raw_v + 0.6 * old_v
+                # Cap speed
+                speed = np.linalg.norm(smooth_v)
+                self.tracked_vels[name] = (smooth_v / speed * 1.5) if speed > 1.5 else smooth_v
+            else:
+                self.tracked_vels[name] = np.zeros(3)
                 
-                if self.last_tracker_pos is not None and dt > min_dt:
-                    # Raw velocity
-                    raw_vel_vector = (pos - self.last_tracker_pos) / dt
-                    raw_vel_base = self.T_C_to_B[:3, :3] @ raw_vel_vector 
-                    
-                    # Apply EMA Filter to smooth velocity reading to avoid spikes in CBF response
-                    # Can increase filter weight once we get higher hz of obstacle positions
-                    # 0.4 means trust the new reading 40%, trust the old history 60%
-                    filter_weight = 0.4 
-                    self.filtered_vel = (filter_weight * raw_vel_base) + ((1.0 - filter_weight) * self.filtered_vel)
+            self.last_tracker_pos[name] = pos_base
 
-                    # Cap smoothed velocity
-                    speed = np.linalg.norm(self.filtered_vel)
-                    if speed > 1.5: # Prevent errors
-                        self.filtered_vel = (self.filtered_vel / speed) * 1.5
-                        
-                    marker_velocities.append(self.filtered_vel)
-                else:
-                    marker_velocities.append(np.zeros(3))
-                
-                self.last_tracker_pos = pos
-
-        self.tracker_centroids = np.array(marker_positions) if marker_positions else np.zeros((0, 3))
-        self.tracker_velocities = np.array(marker_velocities) if marker_velocities else np.zeros((0, 3))
-        self.current_obs_pos, self.current_obs_radii, self.current_obs_vel = self._get_padded_obstacles()
+        # After updating all joints, build the capsules
+        self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end = self._get_padded_obstacles()
 
     def _jit_compile(self):
         """Dummy data to trigger JIT compilation of the control function during initialization."""
@@ -486,7 +519,7 @@ class OSCBFNode(Node):
         _ = np.asarray(
             compute_control(
                 self.robot, self.osc_controller, self.cbf, z, z_ee_des,
-                self.current_obs_pos, self.current_obs_radii, self.current_obs_vel
+                self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end
             )
         )
     
@@ -520,9 +553,11 @@ class OSCBFNode(Node):
             self.cbf,
             self.last_joint_state,
             self.last_received_target_state,
-            self.current_obs_pos,
-            self.current_obs_radii,
-            self.current_obs_vel
+            self.curr_obs_start,
+            self.curr_obs_end,
+            self.curr_obs_radii,
+            self.curr_obs_v_start,
+            self.curr_obs_v_end
         )
         msg.data = tau.tolist()
         self.torque_pub.publish(msg)
