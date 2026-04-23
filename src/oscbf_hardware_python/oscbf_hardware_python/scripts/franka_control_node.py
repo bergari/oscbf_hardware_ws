@@ -125,6 +125,8 @@ class CollisionsConfig(OSCBFTorqueConfig):
         robot: Manipulator,
         whole_body_pos_min: ArrayLike,
         whole_body_pos_max: ArrayLike,
+        relax_cbf: bool = False,               # Default to strict
+        cbf_relaxation_penalty: float = 1e4    # Default penalty weight
     ):
         self.q_min = robot.joint_lower_limits
         self.q_max = robot.joint_upper_limits
@@ -163,12 +165,13 @@ class CollisionsConfig(OSCBFTorqueConfig):
         rob_vel = rob_vel_rad[:, :3]
 
         # Find closest point on each capsule centerline to each robot sphere center
+        # Utillize broadcasting to compute for all robot spheres and all capsules in one go
         A = obs_start[None, :, :] # Start of segment (1, N_obs, 3)
         B = obs_end[None, :, :]   # End of segment (1, N_obs, 3)
         P = rob_pos[:, None, :]   # Robot spheres (N_rob, 1, 3)
 
         AB = B - A
-        AP = P - A
+        AP = P - A # Shape (N_rob, N_obs, 3)
 
         AB_dot_AB = jnp.sum(AB * AB, axis=-1) + 1e-6 # Avoid div by zero
         AP_dot_AB = jnp.sum(AP * AB, axis=-1)
@@ -194,7 +197,7 @@ class CollisionsConfig(OSCBFTorqueConfig):
         h0_dot = jnp.sum(normals * delta_v, axis=2)
 
         radii_sum = rob_radii[:, None] + obs_radii[None, :]
-        safety_padding = 0.05 # use for testing, but better way is to adapt capsule radii
+        safety_padding = 0.1 # use for testing, but better way is to adapt capsule radii
         h0 = dist - radii_sum - safety_padding
 
         gamma = 2.0
@@ -208,13 +211,6 @@ class CollisionsConfig(OSCBFTorqueConfig):
         q = z[: self.num_joints]
         q_min = jnp.asarray(self.q_min)
         q_max = jnp.asarray(self.q_max)
-
-        if len(args) >= 2:
-            collision_positions = args[0]
-            collision_radii = args[1]
-        else:
-            collision_positions = jnp.full((6, 3), 100.0)
-            collision_radii = jnp.zeros(6)
 
         # Joint Limit Avoidance
         h_joint_limits = jnp.concatenate([q_max - q, q - q_min])
@@ -247,28 +243,16 @@ class CollisionsConfig(OSCBFTorqueConfig):
             - robot_collision_radii
         ).ravel()
 
-        # Collision Avoidance with obstacles (Static, based on position only)
-        # center_deltas = (
-        #     robot_collision_positions[:, None, :] - collision_positions[None, :, :]
-        # ).reshape(-1, 3)
-        # radii_sums = (
-        #     robot_collision_radii[:, None] + collision_radii[None, :]
-        # ).reshape(-1)
-        # safety_padding = 0.0 # Add a safety margin to the combined radii
-        # h_collision = jnp.linalg.norm(center_deltas, axis=1) - radii_sums - safety_padding
-
         return jnp.concatenate([
             h_joint_limits, 
             h_whole_body_upper, 
             h_whole_body_lower, 
             h_singularity, 
             h_table,
-            # h_collision
         ])
 
     def alpha(self, h):
         # Lower = more conservative, higher = more aggressive
-        # For some reason increasing this from 2 to 4 resullts in a steady state offset
         return 4.0 * h
 
     def alpha_2(self, h_2):
@@ -318,13 +302,47 @@ def compute_control(
 
     return tau - g
 
+class FlyingObstacle:
+    """Helper class to manage the state of a single flying obstacle."""
+    def __init__(self, clock, pos_min, pos_max):
+        self.clock = clock
+        self.pos_min = pos_min
+        self.pos_max = pos_max
+        self.switch_interval = np.random.uniform(2.0, 5.0)  # Randomize interval
+        self.last_switch_time = self.clock.now().nanoseconds / 1e9
+        self.start_pos = np.array([
+            np.random.uniform(self.pos_min[i], self.pos_max[i]) for i in range(3)
+        ])
+        self.end_pos = self.start_pos
+        self.radius = np.random.uniform(0.05, 0.1)
+        self.velocity = np.zeros(3)
+
+    def update(self):
+        """Update the obstacle's trajectory if the interval has passed."""
+        current_time = self.clock.now().nanoseconds / 1e9
+        if current_time - self.last_switch_time >= self.switch_interval:
+            self.last_switch_time = current_time
+            self.start_pos = self.get_current_position()  # Start from where it was
+            self.end_pos = np.array([
+                np.random.uniform(self.pos_min[i], self.pos_max[i]) for i in range(3)
+            ])
+            self.radius = np.random.uniform(0.05, 0.15)
+
+    def get_current_position(self):
+        """Calculates the current position along the trajectory."""
+        elapsed_t = self.clock.now().nanoseconds / 1e9 - self.last_switch_time
+        direction = self.end_pos - self.start_pos
+        norm = np.linalg.norm(direction)
+        self.velocity = 0.5 * direction / (norm + 1e-6)  # Move at 0.5 m/s
+        return self.start_pos + self.velocity * elapsed_t
+
 class OSCBFNode(Node):
     MAX_TRACKED_OBS = 10 # Pad to this many obstacles to keep matrix sizes constant
 
     def __init__(
         self,
-        whole_body_pos_min: ArrayLike = (-0.5, -0.75, -0.05), # Define workspace limits
-        whole_body_pos_max: ArrayLike = (1.0, 0.75, 1.0),
+        whole_body_pos_min: ArrayLike = (-0.5, -0.6, -0.05), # Define workspace limits
+        whole_body_pos_max: ArrayLike = (1.0, 0.6, 1.2),
     ):
         super().__init__("oscbf_node")
         self.get_logger().info("Initializing OSCBF Node...")
@@ -359,6 +377,10 @@ class OSCBFNode(Node):
             Float32MultiArray, "franka/robot_spheres", qos_profile
         )
 
+        self.obstacle_pub = self.create_publisher(
+            Float32MultiArray, "franka/obstacle_data", qos_profile
+        )
+
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -380,17 +402,17 @@ class OSCBFNode(Node):
         self.get_logger().info("Loading Franka model...")
         self.robot = load_panda()
 
-        # Transform form camera frame to robot base frame (if desired to do manually else set to identity)
-        self.T_C_to_B = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
-        
+        # Create and manage multiple flying obstacles
+        self.num_flying_obstacles = 3
+        self.flying_obstacles = [
+            FlyingObstacle(self.get_clock(), whole_body_pos_min, whole_body_pos_max) 
+            for _ in range(self.num_flying_obstacles)
+        ]
+
         # Initialize CBF 
         self.get_logger().info("Creating CBF...")
-        self.cbf_config = CollisionsConfig(self.robot, whole_body_pos_min, whole_body_pos_max)
+        # Set relax_cbf=Ture to enable soft constrained QP, leave at false to keep hard contraints.
+        self.cbf_config = CollisionsConfig(self.robot, whole_body_pos_min, whole_body_pos_max, relax_cbf=False, cbf_relaxation_penalty=1e4)
         self.cbf = CBF.from_config(self.cbf_config)
         
         # Initialize the padded arrays for dynamic obstacles
@@ -457,7 +479,33 @@ class OSCBFNode(Node):
         
         # We must pad up to exactly MAX_TRACKED_OBS (10) for JAX to stay compiled
         num_padding = self.MAX_TRACKED_OBS - num_tracked
-        
+
+        # Add static obstacles
+        # start_list.append(np.array([0.45, 0.0, 0.0]))
+        # end_list.append(np.array([0.45, 0.0, 0.1]))
+        # rad_list.append(0.15)
+        # v_start_list.append(np.zeros(3))
+        # v_end_list.append(np.zeros(3))
+
+        # Add random flying obstacles from our list
+        for i, obs in enumerate(self.flying_obstacles):
+            obs.update()
+            position = obs.get_current_position()
+            
+            # A sphere is a capsule with the same start and end point
+            start_list.append(position)
+            end_list.append(position)
+            rad_list.append(obs.radius)
+            v_start_list.append(obs.velocity)
+            v_end_list.append(obs.velocity)
+
+            # Publish them such that they can be visualized in PyBullet
+            # For simplicity, we'll just publish the first one for now
+            if i == 0:
+                obstacle_pos_msg = Float32MultiArray()
+                obstacle_pos_msg.data = np.append(position, obs.radius).flatten().tolist()
+                self.obstacle_pub.publish(obstacle_pos_msg)
+
         # If we lost tracking of everything, provide at least one dummy target
         if num_tracked == 0:
             start_list.append(np.array([100.0, 0.0, 0.0]))
@@ -488,18 +536,15 @@ class OSCBFNode(Node):
         self.last_tracker_time = t_now
         
         for marker in msg.markers:
-            name = marker.ns  # e.g., "fused_left wrist", "fused_head", etc.
-            pos = np.array([marker.pose.position.x, marker.pose.position.y, marker.pose.position.z])
-            
-            # Convert to base frame immediately for easier math later
-            pos_base = (self.T_C_to_B[:3, :3] @ pos) + self.T_C_to_B[:3, 3]
+            name = marker.ns  # e.g., "fused_left wrist", "fused_nose", etc.
+            pos_base = np.array([marker.pose.position.x, marker.pose.position.y, marker.pose.position.z])
             self.tracked_joints[name] = pos_base
             
-            # Simple EMA Velocity
+            # Simple EMA Velocity to avoid noisy differentiation and a too sharp velocity increase (which happens when dynamic obstacles are received at low frequency)
             if name in self.last_tracker_pos and dt > 0.005:
                 raw_v = (pos_base - self.last_tracker_pos[name]) / dt
                 old_v = self.tracked_vels.get(name, np.zeros(3))
-                smooth_v = 0.4 * raw_v + 0.6 * old_v
+                smooth_v = 0.6 * raw_v + 0.4 * old_v
                 # Cap speed
                 speed = np.linalg.norm(smooth_v)
                 self.tracked_vels[name] = (smooth_v / speed * 1.5) if speed > 1.5 else smooth_v
@@ -509,7 +554,6 @@ class OSCBFNode(Node):
             self.last_tracker_pos[name] = pos_base
 
         # After updating all joints, build the capsules
-        self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end = self._get_padded_obstacles()
 
     def _jit_compile(self):
         """Dummy data to trigger JIT compilation of the control function during initialization."""
@@ -517,9 +561,11 @@ class OSCBFNode(Node):
         z_ee_des = np.concatenate([np.ones(3), np.eye(3).ravel(), np.zeros(3), np.zeros(3)])
         # Compile passing the padded dynamic arrays
         _ = np.asarray(
+            # Call _get_padded_obstacles to get initial dummy data for compilation
+            # This ensures the JAX function is compiled with the correct array shapes.
             compute_control(
-                self.robot, self.osc_controller, self.cbf, z, z_ee_des,
-                self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end
+                self.robot, self.osc_controller, self.cbf, z, z_ee_des, 
+                *self._get_padded_obstacles()
             )
         )
     
@@ -545,6 +591,10 @@ class OSCBFNode(Node):
     def publish_control(self):
         if self.last_joint_state is None or self.last_received_target_state is None:
             return
+
+        # Update and publish obstacle data at the control frequency
+        self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end = self._get_padded_obstacles()
+
         msg = Float64MultiArray()
         # Feed the dynamic obstacle arrays into the compiled loop
         tau = compute_control(

@@ -12,9 +12,10 @@ from rclpy.qos import (
 )
 from oscbf_msgs.msg import EEState
 from geometry_msgs.msg import Point, Quaternion, Vector3
+from std_msgs.msg import Float32MultiArray
 
-from oscbf_hardware_python.utils.trajectory import SinusoidalTaskTrajectory
-from oscbf_hardware_python.utils.trajectory import LinearTaskTrajectory
+# Import your newly added trajectory class
+from oscbf_hardware_python.utils.trajectory import LinearTaskTrajectory, SmoothLinearTrajectory
 
 
 class EETrajNode(Node):
@@ -28,33 +29,21 @@ class EETrajNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
 
-        # Based on the traj from the dynamic motion demo
-        # TODO: make these values inputs
-        self.traj = SinusoidalTaskTrajectory(
-            init_pos=(0.45, 0, 0.45),
-            init_rot=np.array(
-                [
-                    [1, 0, 0],
-                    [0, -1, 0],
-                    [0, 0, -1],
-                ]
-            ),
-            amplitude=(0, 0, 0),
-            #amplitude=(0.2, 0, 0),
-            angular_freq=(1, 0, 0),
-            phase=(0, 0, 0),
-        )
+        # Time tracking
+        self.switch_interval = 10.0  # Switch trajectory every 10 seconds
+        self.last_switch_time = None 
+        
+        # Define a list of target waypoints to cycle through
+        self.target_waypoints = [
+            self.generate_safe_waypoint(),
+        ]
+        self.current_target_idx = 0
+        self.traj = None   
+        self.freq = 1000
 
-        # self.traj = LinearTaskTrajectory(
-        #     start_pos=(0.45, 0, 0.45),
-        #     end_pos=(0.6, 0, 0.45),
-        #     duration=5.0
-        # )
-
-        self.freq = 100
-        self.timer = self.create_timer(1 / self.freq, self.publish_ee_state)
-
+        self.ros_timer = self.create_timer(1 / self.freq, self.publish_ee_state)
         self.ee_state_pub = self.create_publisher(EEState, "ee_state", qos_profile)
+        self.ee_pos_array_pub = self.create_publisher(Float32MultiArray, "ee_target_pos_array", qos_profile)
 
     def publish_ee_state(self):
         """Publish the desired end-effector state"""
@@ -62,10 +51,65 @@ class EETrajNode(Node):
         secs, nanosecs = time.seconds_nanoseconds()
         t = secs + nanosecs / 1e9
 
-        pos = self.traj.position(t)
-        rot = self.traj.rotation(t)
-        vel = self.traj.velocity(t)
-        omega = self.traj.omega(t)
+        # Initialize the first trajectory
+        if self.last_switch_time is None:
+            self.last_switch_time = t
+            start_pos = np.array([0.45, 0.0, 0.45])
+            next_pos = np.array([0.45, 0.0, 0.45]) # Keep init pose for the first 10 seconds
+            dist = np.linalg.norm(next_pos - start_pos)
+            
+            # self.traj = QuinticTaskTrajectory(
+            #     start_pos=start_pos,
+            #     end_pos=next_pos,
+            #     duration=np.linalg.norm(next_pos - start_pos) / 0.1, # 0.1 m/s speed
+            #     start_vel=np.zeros(3) # Start from rest
+            # )
+            self.traj = SmoothLinearTrajectory(
+                start_pos=start_pos,
+                end_pos=next_pos,
+                duration=dist / 0.1
+            )
+            self.get_logger().info(f"Initialized trajectory! Moving to: {next_pos}")
+            return
+
+        # Calculate the elapsed time since the last switch
+        elapsed_t = t - self.last_switch_time
+
+        # Check if 10 seconds have elapsed since the last switch
+        if elapsed_t >= self.switch_interval:
+            # Capture exact state at the time of switching to ensure continuity
+            current_pos = self.traj.position(elapsed_t)
+            current_vel = self.traj.velocity(elapsed_t) 
+
+            self.last_switch_time = t
+            elapsed_t = 0.0 # Reset elapsed time for the newly created trajectory
+
+            # update random target waypoint every switch
+            self.target_waypoints[0] = self.generate_safe_waypoint()
+            
+            # Update to the next target waypoint in the list
+            self.current_target_idx = (self.current_target_idx + 1) % len(self.target_waypoints)
+            next_pos = np.array(self.target_waypoints[self.current_target_idx])
+
+            # Start the new trajectory from exactly where we are, conserving velocity
+            dist = np.linalg.norm(next_pos - current_pos)
+            # self.traj = QuinticTaskTrajectory(
+            #     start_pos=current_pos,
+            #     end_pos=next_pos,
+            #     duration=dist / 0.1,  # Adjust duration based on desired speed (0.1 m/s speed)
+            #     start_vel=current_vel # CRITICAL: Pass in the current velocity to prevent jitter
+            # )
+            self.traj = SmoothLinearTrajectory(
+                start_pos=current_pos,
+                end_pos=next_pos,
+                duration=dist / 0.1  # 0.1 m/s average speed
+            )
+            self.get_logger().info(f"Switched trajectory! Moving to: {next_pos}")
+
+        pos = self.traj.position(elapsed_t)
+        rot = self.traj.rotation(elapsed_t)
+        vel = self.traj.velocity(elapsed_t)
+        omega = self.traj.omega(elapsed_t)
         xyzw = rmat_to_quat(rot)
 
         msg = EEState()
@@ -77,6 +121,24 @@ class EETrajNode(Node):
 
         self.ee_state_pub.publish(msg)
 
+        array_msg = Float32MultiArray()
+        array_msg.data = [float(pos[0]), float(pos[1]), float(pos[2])] 
+        self.ee_pos_array_pub.publish(array_msg)
+
+    def generate_safe_waypoint(self):
+            """Generates a random waypoint guaranteed to be safely inside the Franka workspace."""
+            max_safe_radius = 0.75  # Keep it comfortably under the 0.855m absolute limit
+            
+            while True:
+                target = np.array([
+                    np.random.uniform(0.25, 0.65), 
+                    np.random.uniform(-0.3, 0.3), 
+                    np.random.uniform(0.2, 0.7)
+                ])
+                
+                # Check if the absolute distance from base is within the safe sphere
+                if np.linalg.norm(target) <= max_safe_radius:
+                    return target
 
 def rmat_to_quat(rmat: np.ndarray) -> np.ndarray:
     """Converts a rotation matrix into XYZW quaternions

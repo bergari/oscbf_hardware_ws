@@ -170,3 +170,61 @@ class LinearTaskTrajectory(TaskTrajectory):
     def alpha(self, t: float) -> np.ndarray:
         """No angular acceleration."""
         return np.zeros(3)
+    
+class SmoothLinearTrajectory:
+    """Defines a perfectly straight geometric path with a smooth (quintic) velocity/acceleration ramp."""
+
+    def __init__(self, start_pos, end_pos, duration, init_rot=None):
+        self.start_pos = np.asarray(start_pos)
+        self.end_pos = np.asarray(end_pos)
+        
+        # Prevent division by zero
+        self.duration = max(duration, 0.001)
+        
+        self.delta_pos = self.end_pos - self.start_pos
+
+        if init_rot is None:
+            self.init_rot = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        else:
+            self.init_rot = np.asarray(init_rot)
+
+    def _get_s_and_derivatives(self, t: float):
+        """Calculates a smooth quintic scaling factor s(t) from 0 to 1, and its derivatives."""
+        # Clamp time between 0 and duration
+        t = min(max(t, 0.0), self.duration)
+        
+        # Normalized time tau goes from 0.0 to 1.0
+        tau = t / self.duration 
+        
+        # Quintic polynomial for position scaling: 10tau^3 - 15tau^4 + 6tau^5
+        s = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
+        
+        # Derivative of s with respect to time (chain rule applied: d(tau)/dt = 1/duration)
+        s_dot = (30 * tau**2 - 60 * tau**3 + 30 * tau**4) / self.duration
+        
+        # Second derivative (acceleration scaling)
+        s_ddot = (60 * tau - 180 * tau**2 + 120 * tau**3) / (self.duration**2)
+        
+        return s, s_dot, s_ddot
+
+    def position(self, t: float) -> np.ndarray:
+        s, _, _ = self._get_s_and_derivatives(t)
+        return self.start_pos + s * self.delta_pos
+
+    def rotation(self, t: float) -> np.ndarray:
+        return self.init_rot
+
+    def velocity(self, t: float) -> np.ndarray:
+        _, s_dot, _ = self._get_s_and_derivatives(t)
+        # Multiplies the smooth scalar velocity profile by the 3D direction vector
+        return s_dot * self.delta_pos
+
+    def acceleration(self, t: float) -> np.ndarray:
+        _, _, s_ddot = self._get_s_and_derivatives(t)
+        return s_ddot * self.delta_pos
+
+    def omega(self, t: float) -> np.ndarray:
+        return np.zeros(3)
+
+    def alpha(self, t: float) -> np.ndarray:
+        return np.zeros(3)
