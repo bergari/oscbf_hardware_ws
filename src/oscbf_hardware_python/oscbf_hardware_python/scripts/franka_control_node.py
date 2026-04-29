@@ -12,6 +12,8 @@ Subscribes:
 import signal
 import time
 import sys
+import os
+import csv
 from functools import partial
 
 import jax
@@ -40,7 +42,6 @@ from oscbf.core.oscbf_configs import OSCBFTorqueConfig
 from oscbf.core.controllers import PoseTaskTorqueController
 
 jax.config.update("jax_enable_x64", True)
-
 
 @jax.tree_util.register_static
 class DemoConfig(OSCBFTorqueConfig):
@@ -200,8 +201,9 @@ class CollisionsConfig(OSCBFTorqueConfig):
         safety_padding = 0.1 # use for testing, but better way is to adapt capsule radii
         h0 = dist - radii_sum - safety_padding
 
-        gamma = 2.0
-        h_collision_dynamic = (h0_dot + gamma * h0).ravel()
+        # Lower gamma = earlier responding, higher gamma = later responding. Value of 2.0 proved good in real life testing
+        gamma = 50
+        h_collision_dynamic = (h0_dot + gamma * h0).ravel() # constraint: h_dot + gamma * h >= 0 -> h_dot >= -gamma * h
 
         return jnp.concatenate([h_qdot, h_collision_dynamic])
 
@@ -219,16 +221,16 @@ class CollisionsConfig(OSCBFTorqueConfig):
         sigmas = jax.lax.linalg.svd(self.robot.ee_jacobian(q), compute_uv=False)
         h_singularity = jnp.array([jnp.prod(sigmas) - self.singularity_tol])
 
-        # Get robot sphere positions (WE NEED THIS UNCOMMENTED)
+        # Get robot sphere positions
         robot_collision_pos_rad = self.robot.link_collision_data(q)
         robot_collision_positions = robot_collision_pos_rad[:, :3]
         robot_collision_radii = robot_collision_pos_rad[:, 3, None]
         robot_num_pts = robot_collision_positions.shape[0]
 
         # Static Table Avoidance (Z-axis floor)
-        h_table = (
-            robot_collision_positions[:, 2] - robot_collision_radii.ravel()
-        )
+        # h_table = (
+        #     robot_collision_positions[:, 2] - robot_collision_radii.ravel()
+        # )
 
         # Whole-body Set Containment (Workspace bounding box)
         h_whole_body_upper = (
@@ -247,16 +249,17 @@ class CollisionsConfig(OSCBFTorqueConfig):
             h_joint_limits, 
             h_whole_body_upper, 
             h_whole_body_lower, 
-            h_singularity, 
-            h_table,
+            h_singularity,
         ])
 
     def alpha(self, h):
         # Lower = more conservative, higher = more aggressive
-        return 4.0 * h
+        # Value of 4.0 proved good in real life testing
+        return 20.0 * h
 
     def alpha_2(self, h_2):
-        return 2.0 * h_2
+        # Value of 2.0 proved good in real life testing
+        return 20.0 * h_2
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def compute_control(
@@ -304,44 +307,100 @@ def compute_control(
 
 class FlyingObstacle:
     """Helper class to manage the state of a single flying obstacle."""
-    def __init__(self, clock, pos_min, pos_max):
+    def __init__(self, clock, pos_min, pos_max, radius, speed):
         self.clock = clock
         self.pos_min = pos_min
         self.pos_max = pos_max
-        self.switch_interval = np.random.uniform(2.0, 5.0)  # Randomize interval
         self.last_switch_time = self.clock.now().nanoseconds / 1e9
-        self.start_pos = np.array([
-            np.random.uniform(self.pos_min[i], self.pos_max[i]) for i in range(3)
-        ])
-        self.end_pos = self.start_pos
-        self.radius = np.random.uniform(0.05, 0.1)
+        
+        self.start_pos = self.pos_min
+        self.end_pos = self.pos_max
+        self.radius = radius
+        self.speed = speed  # This is now the PEAK speed (v_max)
+        
+        self.is_currently_colliding = False
         self.velocity = np.zeros(3)
+        
+        # Calculate initial trajectory parameters
+        self._update_trajectory_params()
+
+    def _update_trajectory_params(self):
+        """Calculates distance and total required time based on the sine-wave profile."""
+        self.current_distance = np.linalg.norm(self.end_pos - self.start_pos)
+        
+        # The integral of the sine wave requires T = (pi * D) / (2 * v_max)
+        if self.speed > 0 and self.current_distance > 1e-6:
+            self.total_time = (np.pi * self.current_distance) / (2.0 * self.speed)
+        else:
+            self.total_time = 1.0 # Fallback to prevent division by zero
 
     def update(self):
-        """Update the obstacle's trajectory if the interval has passed."""
-        current_time = self.clock.now().nanoseconds / 1e9
-        if current_time - self.last_switch_time >= self.switch_interval:
-            self.last_switch_time = current_time
-            self.start_pos = self.get_current_position()  # Start from where it was
-            self.end_pos = np.array([
-                np.random.uniform(self.pos_min[i], self.pos_max[i]) for i in range(3)
-            ])
-            self.radius = np.random.uniform(0.05, 0.15)
+        elapsed_t = self.clock.now().nanoseconds / 1e9 - self.last_switch_time
+        
+        # Instead of checking distance, we check if the time interval has completed
+        if elapsed_t >= self.total_time:
+            self.last_switch_time = self.clock.now().nanoseconds / 1e9
+            
+            # Snap start position to exact end position to avoid drift
+            self.start_pos = self.end_pos.copy() 
+            
+            fixed_axis = np.random.randint(0, 3)
+            side = np.random.choice([self.pos_min[fixed_axis], self.pos_max[fixed_axis]])
+            new_end = np.array([np.random.uniform(self.pos_min[i], self.pos_max[i]) for i in range(3)])
+            new_end[fixed_axis] = side
+            self.end_pos = new_end
+            
+            # Recompute total time for the new trajectory length
+            self._update_trajectory_params()
+            return True
+            
+        return False
 
     def get_current_position(self):
-        """Calculates the current position along the trajectory."""
+        if self.current_distance < 1e-6:
+            self.velocity = np.zeros(3)
+            return self.start_pos
+            
         elapsed_t = self.clock.now().nanoseconds / 1e9 - self.last_switch_time
-        direction = self.end_pos - self.start_pos
-        norm = np.linalg.norm(direction)
-        self.velocity = 0.5 * direction / (norm + 1e-6)  # Move at 0.5 m/s
-        return self.start_pos + self.velocity * elapsed_t
+        
+        # Clamp time to prevent overshooting if update loop lags slightly
+        t = min(elapsed_t, self.total_time)
+        
+        # Progress factor from 0.0 to 1.0 using the integrated sine wave
+        progress = 0.5 * (1.0 - np.cos(np.pi * t / self.total_time))
+        
+        # Calculate actual velocity vector
+        current_speed = self.speed * np.sin(np.pi * t / self.total_time)
+        direction = (self.end_pos - self.start_pos) / self.current_distance
+        self.velocity = direction * current_speed
+        
+        # Compute exact position
+        actual_position = self.start_pos + (self.end_pos - self.start_pos) * progress
+        return np.clip(actual_position, self.pos_min, self.pos_max)
+    
+    def check_collision_event(self, robot_spheres):
+        """
+        Returns True ONLY on the first frame of a collision.
+        """
+        robot_positions, robot_radii = robot_spheres
+        current_pos = self.get_current_position()
+        
+        distances = np.linalg.norm(robot_positions - current_pos, axis=1)
+        touching_now = np.any(distances < (self.radius + robot_radii.flatten()))
+        
+        collision_triggered = False
+        if touching_now and not self.is_currently_colliding:
+            collision_triggered = True  # First hit
+        
+        self.is_currently_colliding = touching_now
+        return collision_triggered
 
 class OSCBFNode(Node):
-    MAX_TRACKED_OBS = 10 # Pad to this many obstacles to keep matrix sizes constant
+    MAX_TRACKED_OBS = 3 # Pad to this many obstacles to keep matrix sizes constant
 
     def __init__(
         self,
-        whole_body_pos_min: ArrayLike = (-0.5, -0.6, -0.05), # Define workspace limits
+        whole_body_pos_min: ArrayLike = (-0.5, -0.6, 0.0), # Define workspace limits
         whole_body_pos_max: ArrayLike = (1.0, 0.6, 1.2),
     ):
         super().__init__("oscbf_node")
@@ -402,11 +461,26 @@ class OSCBFNode(Node):
         self.get_logger().info("Loading Franka model...")
         self.robot = load_panda()
 
+        self.counter = 0
+        self.counter2 = 0
+
+        # Initialize tracking metrics
+        self.num_collisions = 0
+
         # Create and manage multiple flying obstacles
-        self.num_flying_obstacles = 3
+        self.num_flying_obstacles = int(os.getenv("OBSTACLE_COUNT", 2))
+        self.radius = float(os.getenv("OBSTACLE_RADIUS", 0.05))
+        self.speed = float(os.getenv("OBSTACLE_SPEED", 1.0))
+        start_point_min = np.array([0.1+self.radius, -0.8+self.radius, 0+self.radius])
+        start_point_max = np.array([0.85-self.radius, 0.8-self.radius, 1.0-self.radius])
         self.flying_obstacles = [
-            FlyingObstacle(self.get_clock(), whole_body_pos_min, whole_body_pos_max) 
-            for _ in range(self.num_flying_obstacles)
+            FlyingObstacle(
+                self.get_clock(), 
+                start_point_min, 
+                start_point_max, 
+                radius=self.radius, 
+                speed=self.speed
+            ) for i in range(self.num_flying_obstacles)
         ]
 
         # Initialize CBF 
@@ -441,6 +515,7 @@ class OSCBFNode(Node):
 
     def _get_padded_obstacles(self):
         start_list, end_list, rad_list, v_start_list, v_end_list = [], [], [], [], []
+        self.counter += 1
         
         def add_capsule(j_start, j_end, radius):
             """Helper to add a capsule if both joints are currently tracked"""
@@ -455,22 +530,22 @@ class OSCBFNode(Node):
             """A sphere is just a capsule where start and end are the same point"""
             add_capsule(joint, joint, radius)
 
-        # 1. Wrists (15cm Spheres)
+        # Wrists (15cm Spheres)
         add_sphere("fused_left wrist", 0.15)
         add_sphere("fused_right wrist", 0.15)
         
-        # 2. Lower Arms (8cm Capsules)
+        # Lower Arms (8cm Capsules)
         add_capsule("fused_left elbow", "fused_left wrist", 0.08)
         add_capsule("fused_right elbow", "fused_right wrist", 0.08)
         
-        # 3. Upper Arms (10cm Capsules)
+        # Upper Arms (10cm Capsules)
         add_capsule("fused_left shoulder", "fused_left elbow", 0.10)
         add_capsule("fused_right shoulder", "fused_right elbow", 0.10)
         
-        # 4. Head (10cm Sphere)
+        # Head (10cm Sphere)
         add_sphere("fused_nose", 0.10) 
         
-        # 5. Torso Sides (15cm Capsules)
+        # Torso Sides (15cm Capsules)
         add_capsule("fused_left shoulder", "fused_left hip", 0.15)
         add_capsule("fused_right shoulder", "fused_right hip", 0.15)
 
@@ -487,10 +562,15 @@ class OSCBFNode(Node):
         # v_start_list.append(np.zeros(3))
         # v_end_list.append(np.zeros(3))
 
-        # Add random flying obstacles from our list
-        for i, obs in enumerate(self.flying_obstacles):
+        # Add random flying obstacle
+        fly_obs_positions = []
+        fly_obs_radii = []
+        for obs in self.flying_obstacles:
             obs.update()
             position = obs.get_current_position()
+            radius = obs.radius
+            fly_obs_positions.append(position)
+            fly_obs_radii.append(radius)
             
             # A sphere is a capsule with the same start and end point
             start_list.append(position)
@@ -499,13 +579,31 @@ class OSCBFNode(Node):
             v_start_list.append(obs.velocity)
             v_end_list.append(obs.velocity)
 
-            # Publish them such that they can be visualized in PyBullet
-            # For simplicity, we'll just publish the first one for now
-            if i == 0:
-                obstacle_pos_msg = Float32MultiArray()
-                obstacle_pos_msg.data = np.append(position, obs.radius).flatten().tolist()
+        # Publish them such that they can be visualized in PyBullet
+        if self.counter % 20 == 0: # Publish at 50Hz to avoid flooding
+            obstacle_pos_msg = Float32MultiArray()
+            for i, obs in enumerate(self.flying_obstacles):
+                obs.update()
+                pos = obs.get_current_position()
+                # Data: [ID, x, y, z, radius]
+                msg_data = [float(i)] + pos.tolist() + [float(obs.radius)]
+                
+                obstacle_pos_msg.data = msg_data
                 self.obstacle_pub.publish(obstacle_pos_msg)
-
+        
+            # Count number of collisions with robot spheres
+            # Get robot sphere positions
+            q = self.last_joint_state[: self.robot.num_joints] if self.last_joint_state is not None else np.zeros(self.robot.num_joints)
+            robot_collision_pos_rad = self.robot.link_collision_data(q)
+            robot_collision_positions = robot_collision_pos_rad[:, :3]
+            robot_collision_radii = robot_collision_pos_rad[:, 3, None]
+            for obs in self.flying_obstacles:
+                # This only returns True on the very first frame of contact
+                if obs.check_collision_event(robot_spheres=[robot_collision_positions, robot_collision_radii]):
+                    self.num_collisions += 1
+                    self.get_logger().warn(
+                        f"NEW Collision! Total: {self.num_collisions}"
+                    )
         # If we lost tracking of everything, provide at least one dummy target
         if num_tracked == 0:
             start_list.append(np.array([100.0, 0.0, 0.0]))
@@ -544,7 +642,7 @@ class OSCBFNode(Node):
             if name in self.last_tracker_pos and dt > 0.005:
                 raw_v = (pos_base - self.last_tracker_pos[name]) / dt
                 old_v = self.tracked_vels.get(name, np.zeros(3))
-                smooth_v = 0.6 * raw_v + 0.4 * old_v
+                smooth_v = 1.0 * raw_v + 0 * old_v
                 # Cap speed
                 speed = np.linalg.norm(smooth_v)
                 self.tracked_vels[name] = (smooth_v / speed * 1.5) if speed > 1.5 else smooth_v
@@ -592,6 +690,8 @@ class OSCBFNode(Node):
         if self.last_joint_state is None or self.last_received_target_state is None:
             return
 
+        self.counter2 += 1
+
         # Update and publish obstacle data at the control frequency
         self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end = self._get_padded_obstacles()
 
@@ -612,10 +712,11 @@ class OSCBFNode(Node):
         msg.data = tau.tolist()
         self.torque_pub.publish(msg)
 
-        spheres_jax = self.robot.link_collision_data(self.last_joint_state[: self.robot.num_joints])
-        spheres_msg = Float32MultiArray()
-        spheres_msg.data = np.asarray(spheres_jax).flatten().tolist()
-        self.sphere_pub.publish(spheres_msg)
+        if self.counter2 % 20 == 0: # Publish at 50Hz to avoid flooding
+            spheres_jax = self.robot.link_collision_data(self.last_joint_state[: self.robot.num_joints])
+            spheres_msg = Float32MultiArray()
+            spheres_msg.data = np.asarray(spheres_jax).flatten().tolist()
+            self.sphere_pub.publish(spheres_msg)
 
     def signal_handler(self, sig, frame):
         """Handle shutdown signals by publishing zero torques."""
@@ -635,6 +736,30 @@ class OSCBFNode(Node):
         for _ in range(3):
             self.torque_pub.publish(msg)
             time.sleep(1 / self.control_freq)
+
+    def log_results(self):
+        """Final save before the node is killed by the bash script."""
+        file_path = "grid_search_results.csv"
+        file_exists = os.path.isfile(file_path)
+        
+        # We focus only on the parameters and the final collision count
+        with open(file_path, "a") as f:
+            writer = csv.writer(f)
+            # Write header only if the file is brand new
+            if not file_exists:
+                writer.writerow(["N", "Radius", "Speed", "Total_Collisions"])
+            
+            writer.writerow([
+                self.num_flying_obstacles, 
+                self.radius, 
+                self.speed, 
+                self.num_collisions
+            ])
+        self.get_logger().info(f"DATA LOGGED: {self.num_collisions} collisions detected.")
+
+    def destroy_node(self):
+        self.log_results()
+        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)

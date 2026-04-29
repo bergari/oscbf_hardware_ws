@@ -3,3 +3,5 @@ __pycache__
 .python-version
 site/
 .vscode/
+.csv
+.png

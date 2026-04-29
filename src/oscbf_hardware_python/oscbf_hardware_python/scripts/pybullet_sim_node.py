@@ -8,6 +8,8 @@ and publishes joint states
 
 import numpy as np
 import pybullet
+import csv
+import os
 from pybullet_utils.bullet_client import BulletClient
 
 import rclpy
@@ -28,6 +30,7 @@ from oscbf.core.manipulator import Manipulator, load_panda
 from oscbf.core.oscbf_configs import OSCBFTorqueConfig
 from oscbf.core.controllers import PoseTaskTorqueController
 from oscbf.core.manipulation_env import FrankaTorqueControlEnv
+from oscbf_hardware_python.utils.visualization import visualize_3D_box
 
 
 class PybulletNode(Node):
@@ -35,8 +38,22 @@ class PybulletNode(Node):
         super().__init__("pybullet_node")
 
         self.freq = 1000
-        self.env = FrankaTorqueControlEnv(timestep=1 / self.freq, target_pos=(0.5, 0, 0.2))
-        self.obstacle_id = None
+        self.env = FrankaTorqueControlEnv(timestep=1 / self.freq, target_pos=(0.5, 0, 0.2), load_floor=True)
+        self.obstacle_ids = {}
+
+        # Visualize workspace limits
+        start_point_min = np.array([0.1, -0.8, 0])
+        start_point_max = np.array([0.85, 0.8, 1.0])
+        visualize_3D_box(
+            box=(start_point_min, start_point_max), rgba=(1, 0, 0, 0.2), client=self.env.client
+        )
+
+        self.csv_filename = "torque_data.csv"
+        self.csv_file = open(self.csv_filename, mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        header = ["timestamp"] + [f"joint_{i}_torque" for i in range(self.env.num_joints)]
+        self.csv_writer.writerow(header)
+        self.counter = 0
 
         qos_profile = QoSProfile(
             depth=10,
@@ -94,27 +111,29 @@ class PybulletNode(Node):
         self.env.apply_control(joint_torques)
         #print("applied torques")
 
+        # Log the torques to a CSV file
+        self.counter += 1
+        if self.counter % 100 == 0: # Log every 100th message (10Hz) to avoid excessive file writing
+            timestamp = self.get_clock().now().nanoseconds / 1e9
+            row = [timestamp] + joint_torques.tolist()
+            self.csv_writer.writerow(row)
         # Step sim
         self.env.step()
 
     def obstacle_callback(self, msg):
-        # Convert the Float32MultiArray message to a numpy array
-        obstacle_data = np.array(msg.data)
-        if len(obstacle_data) == 4:
-            pos = obstacle_data[:3]
-            radius = obstacle_data[3]
+        data = np.array(msg.data)
+        if len(data) == 5:
+            obs_id_idx = int(data[0])
+            pos = data[1:4]
+            radius = data[4]
 
-            if self.obstacle_id is not None:
-                # If the obstacle exists, update its position
-                self.env.client.resetBasePositionAndOrientation(self.obstacle_id, pos, [0, 0, 0, 1])
+            if obs_id_idx in self.obstacle_ids:
+                # Update existing obstacle
+                self.env.client.resetBasePositionAndOrientation(self.obstacle_ids[obs_id_idx], pos, [0, 0, 0, 1])
             else:
-                # Otherwise, create it
-                visual_shape_id = self.env.client.createVisualShape(
-                    shapeType=pybullet.GEOM_SPHERE,
-                    radius=radius,
-                    rgbaColor=[1, 0, 0, 0.5]  # Red with some transparency
-                )
-                self.obstacle_id = self.env.client.createMultiBody(baseVisualShapeIndex=visual_shape_id, basePosition=pos)
+                # Create new obstacle and store in dict
+                v_id = self.env.client.createVisualShape(pybullet.GEOM_SPHERE, radius=radius, rgbaColor=[1,0,0,1])
+                self.obstacle_ids[obs_id_idx] = self.env.client.createMultiBody(baseVisualShapeIndex=v_id, basePosition=pos)
 
     def ee_state_callback(self, msg: EEState):
         pos: Point = msg.pose.position

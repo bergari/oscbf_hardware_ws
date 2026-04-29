@@ -69,7 +69,7 @@ class EETrajNode(Node):
                 end_pos=next_pos,
                 duration=dist / 0.1
             )
-            self.get_logger().info(f"Initialized trajectory! Moving to: {next_pos}")
+            # self.get_logger().info(f"Initialized trajectory! Moving to: {next_pos}")
             return
 
         # Calculate the elapsed time since the last switch
@@ -104,7 +104,7 @@ class EETrajNode(Node):
                 end_pos=next_pos,
                 duration=dist / 0.1  # 0.1 m/s average speed
             )
-            self.get_logger().info(f"Switched trajectory! Moving to: {next_pos}")
+            # self.get_logger().info(f"Switched trajectory! Moving to: {next_pos}")
 
         pos = self.traj.position(elapsed_t)
         rot = self.traj.rotation(elapsed_t)
