@@ -1,6 +1,7 @@
 """ROS2 node for publishing desired end-effector states from an example trajectory"""
 
 import numpy as np
+import os
 
 import rclpy
 from rclpy.node import Node
@@ -12,7 +13,7 @@ from rclpy.qos import (
 )
 from oscbf_msgs.msg import EEState
 from geometry_msgs.msg import Point, Quaternion, Vector3
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Int64
 
 # Import your newly added trajectory class
 from oscbf_hardware_python.utils.trajectory import LinearTaskTrajectory, SmoothLinearTrajectory
@@ -31,45 +32,86 @@ class EETrajNode(Node):
 
         # Time tracking
         self.switch_interval = 10.0  # Switch trajectory every 10 seconds
-        self.last_switch_time = None 
-        
+        self.last_switch_time = None
+
+        # Replicability: use a trajectory-specific seed, separate from the obstacle seed.
+        seed_str = os.getenv("TRAJ_RANDOM_SEED")
+        self.traj_random_seed = (
+            int(seed_str) if seed_str is not None else int(np.random.randint(0, 2**31 - 1))
+        )
+        np.random.seed(self.traj_random_seed)
+        self.get_logger().info(f"Trajectory seed: {self.traj_random_seed}")
+
         # Define a list of target waypoints to cycle through
         self.target_waypoints = [
             self.generate_safe_waypoint(),
         ]
         self.current_target_idx = 0
-        self.traj = None   
+        self.current_reference_pos = np.array([0.45, 0.0, 0.45])
+        self.traj = None
         self.freq = 1000
+        self.publish_counter = 0
+        self.reference_heartbeat_hz = float(os.getenv("REFERENCE_HEARTBEAT_HZ", 10.0))
+        self.reference_publish_interval = (
+            1.0 / self.reference_heartbeat_hz
+            if self.reference_heartbeat_hz > 0.0
+            else None
+        )
+        self.last_reference_publish_time = None
 
         self.ros_timer = self.create_timer(1 / self.freq, self.publish_ee_state)
         self.ee_state_pub = self.create_publisher(EEState, "ee_state", qos_profile)
         self.ee_pos_array_pub = self.create_publisher(Float32MultiArray, "ee_target_pos_array", qos_profile)
+        self.ee_traj_seed_pub = self.create_publisher(Int64, "ee_traj_seed", qos_profile)
+
+    def publish_traj_seed(self):
+        msg = Int64()
+        msg.data = int(self.traj_random_seed)
+        self.ee_traj_seed_pub.publish(msg)
+
+    def publish_reference(self, t, force=False):
+        if not force:
+            if self.reference_publish_interval is None:
+                return
+            if (
+                self.last_reference_publish_time is not None
+                and t - self.last_reference_publish_time < self.reference_publish_interval
+            ):
+                return
+
+        msg = Float32MultiArray()
+        msg.data = [
+            float(self.current_reference_pos[0]),
+            float(self.current_reference_pos[1]),
+            float(self.current_reference_pos[2]),
+        ]
+        self.ee_pos_array_pub.publish(msg)
+        self.last_reference_publish_time = t
 
     def publish_ee_state(self):
         """Publish the desired end-effector state"""
         time = self.get_clock().now()
         secs, nanosecs = time.seconds_nanoseconds()
         t = secs + nanosecs / 1e9
+        self.publish_counter += 1
+        if self.publish_counter == 1 or self.publish_counter % self.freq == 0:
+            self.publish_traj_seed()
 
         # Initialize the first trajectory
         if self.last_switch_time is None:
             self.last_switch_time = t
             start_pos = np.array([0.45, 0.0, 0.45])
             next_pos = np.array([0.45, 0.0, 0.45]) # Keep init pose for the first 10 seconds
+            self.current_reference_pos = next_pos.copy()
             dist = np.linalg.norm(next_pos - start_pos)
-            
-            # self.traj = QuinticTaskTrajectory(
-            #     start_pos=start_pos,
-            #     end_pos=next_pos,
-            #     duration=np.linalg.norm(next_pos - start_pos) / 0.1, # 0.1 m/s speed
-            #     start_vel=np.zeros(3) # Start from rest
-            # )
+
             self.traj = SmoothLinearTrajectory(
                 start_pos=start_pos,
                 end_pos=next_pos,
                 duration=dist / 0.1
             )
             # self.get_logger().info(f"Initialized trajectory! Moving to: {next_pos}")
+            self.publish_reference(t, force=True)
             return
 
         # Calculate the elapsed time since the last switch
@@ -79,31 +121,27 @@ class EETrajNode(Node):
         if elapsed_t >= self.switch_interval:
             # Capture exact state at the time of switching to ensure continuity
             current_pos = self.traj.position(elapsed_t)
-            current_vel = self.traj.velocity(elapsed_t) 
+            current_vel = self.traj.velocity(elapsed_t)
 
             self.last_switch_time = t
             elapsed_t = 0.0 # Reset elapsed time for the newly created trajectory
 
             # update random target waypoint every switch
             self.target_waypoints[0] = self.generate_safe_waypoint()
-            
+
             # Update to the next target waypoint in the list
             self.current_target_idx = (self.current_target_idx + 1) % len(self.target_waypoints)
             next_pos = np.array(self.target_waypoints[self.current_target_idx])
+            self.current_reference_pos = next_pos.copy()
 
             # Start the new trajectory from exactly where we are, conserving velocity
             dist = np.linalg.norm(next_pos - current_pos)
-            # self.traj = QuinticTaskTrajectory(
-            #     start_pos=current_pos,
-            #     end_pos=next_pos,
-            #     duration=dist / 0.1,  # Adjust duration based on desired speed (0.1 m/s speed)
-            #     start_vel=current_vel # CRITICAL: Pass in the current velocity to prevent jitter
-            # )
             self.traj = SmoothLinearTrajectory(
                 start_pos=current_pos,
                 end_pos=next_pos,
                 duration=dist / 0.1  # 0.1 m/s average speed
             )
+            self.publish_reference(t, force=True)
             # self.get_logger().info(f"Switched trajectory! Moving to: {next_pos}")
 
         pos = self.traj.position(elapsed_t)
@@ -119,24 +157,27 @@ class EETrajNode(Node):
         msg.twist.linear = Vector3(x=vel[0], y=vel[1], z=vel[2])
         msg.twist.angular = Vector3(x=omega[0], y=omega[1], z=omega[2])
 
+        self.publish_reference(t)
         self.ee_state_pub.publish(msg)
-
-        array_msg = Float32MultiArray()
-        array_msg.data = [float(pos[0]), float(pos[1]), float(pos[2])] 
-        self.ee_pos_array_pub.publish(array_msg)
 
     def generate_safe_waypoint(self):
             """Generates a random waypoint guaranteed to be safely inside the Franka workspace."""
-            max_safe_radius = 0.75  # Keep it comfortably under the 0.855m absolute limit
-            
+            max_safe_radius = 0.855  # within approximate Franka reach
+
             while True:
                 target = np.array([
-                    np.random.uniform(0.25, 0.65), 
-                    np.random.uniform(-0.3, 0.3), 
-                    np.random.uniform(0.2, 0.7)
+                    np.random.uniform(0.25, 0.7),
+                    np.random.uniform(-0.7, 0.7),
+                    np.random.uniform(0, 0.7)
                 ])
-                
-                # Check if the absolute distance from base is within the safe sphere
+                # target = np.array([
+                #     np.random.uniform(0.35, 0.7),
+                #     np.random.uniform(-0.5, 0.5),
+                #     np.random.uniform(0.2, 0.7)
+                # ])
+                # target = np.array([0.55, 0.0, 0.45])
+
+                # Check if the absolute distance from base is within the reachable sphere
                 if np.linalg.norm(target) <= max_safe_radius:
                     return target
 
