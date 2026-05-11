@@ -196,7 +196,7 @@ class TrackedPointEstimator:
         return self.pos + self.vel * pred_dt, self.vel
 
 class OSCBFNode(Node):
-    MAX_TRACKED_OBS = 3 # Pad to this many obstacles to keep matrix sizes constant
+    MAX_TRACKED_OBS = 10 # Pad to this many obstacles to keep matrix sizes constant
 
     def __init__(
         self,
@@ -319,12 +319,12 @@ class OSCBFNode(Node):
         self._reset_reference_metrics()
 
         # Create and manage multiple flying obstacles
-        self.num_flying_obstacles = int(os.getenv("OBSTACLE_COUNT", 2))
-        self.radius = float(os.getenv("OBSTACLE_RADIUS", 0.05))
-        self.speed = float(os.getenv("OBSTACLE_SPEED", 1.0))
-        # self.num_flying_obstacles = 0
-        # self.radius = 0.05
-        # self.speed = 1.0
+        # self.num_flying_obstacles = int(os.getenv("OBSTACLE_COUNT", 2))
+        # self.radius = float(os.getenv("OBSTACLE_RADIUS", 0.05))
+        # self.speed = float(os.getenv("OBSTACLE_SPEED", 1.0))
+        self.num_flying_obstacles = 0
+        self.radius = 0.05
+        self.speed = 1.0
 
         start_point_min = np.array([0.15+self.radius, -0.8+self.radius, 0+self.radius])
         start_point_max = np.array([0.85-self.radius, 0.8-self.radius, 1.0-self.radius])
@@ -347,7 +347,7 @@ class OSCBFNode(Node):
         # Initialize the padded arrays for dynamic obstacles
         self.curr_obs_start, self.curr_obs_end, self.curr_obs_radii, self.curr_obs_v_start, self.curr_obs_v_end = self._get_padded_obstacles()
 
-        kp_pos = 50.0 # Initial value = 50 # Match desired position
+        kp_pos = 30.0 # Initial value = 50 # Match desired position
         kp_rot = 0.0 # Initial value = 20 # Match desired orientation
         kd_pos = 20.0 # Initial value = 20
         kd_rot = 0.0
@@ -1007,7 +1007,7 @@ class OSCBFNode(Node):
         # )
 
     def destroy_node(self):
-        self.log_results()
+        # self.log_results()
         super().destroy_node()
 
 @jax.tree_util.register_static
@@ -1178,8 +1178,8 @@ class CollisionsConfig(OSCBFTorqueConfig):
         h0 = dist - radii_sum - safety_padding
 
         # Lower gamma = earlier responding, higher gamma = later responding. Value of 2.0 proved good in real life testing
-        gamma = float(os.getenv("CBF_GAMMA", 1.0))
-        # gamma = 1.75
+        # gamma = float(os.getenv("CBF_GAMMA", 1.0))
+        gamma = 1.75
         h_collision_dynamic = (h0_dot + gamma * h0).ravel() # constraint: h_dot + gamma * h >= 0 -> h_dot >= -gamma * h
 
         return jnp.concatenate([h_qdot, h_collision_dynamic])
@@ -1245,11 +1245,11 @@ class CollisionsConfig(OSCBFTorqueConfig):
         # Formula: h_ddot + alpha h_dot + alpha*alpha_2 h >= 0
         # alpha: constant, alpha_2 damping
         # Value of 4.0 proved good in real life testing, 25 in simulation
-        return 25.0 * h
+        return 4.0 * h
 
     def alpha_2(self, h_2):
         # Value of 2.0 proved good in real life testing, 15 in simulation
-        return 15.0 * h_2
+        return 2.0 * h_2
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def compute_control(
